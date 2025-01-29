@@ -1,0 +1,547 @@
+---
+title: "Parc éléctrique français"
+author: "Thomas Barat | Mathéo Richer | Amaury Coutant"
+format: 
+  dashboard:
+    embed-ressources: true
+    theme: [css/StyleCSS.scss]
+    orientation: columns
+---
+
+```{r library }
+#| echo: false
+
+library(readr)
+library(dplyr)
+library(sf)
+library(ggplot2)
+library(plotly)
+library(DT)
+library(geojsonio)
+
+#Bornes
+library(rnaturalearth) # Pour télécharger les cartes des pays
+library(rnaturalearthdata)
+library(shiny)
+library(leaflet)
+library(flexdashboard)
+```
+
+```{r pop dep .Th}
+
+Population <- read_delim("Data/Population.csv",
+                 delim = ";")
+
+Population <- Population[Population$TIME_PERIOD == "2021",]
+Population <- Population[Population$AGE == "_T",]
+Population <- Population[Population$SEX == "_T",]
+Population <- Population[Population$HAR == "_T",]
+
+Population <- Population |>
+  mutate(Dép = substr(GEO, 1, 2))
+
+Population$OBS_VALUE <- gsub(",", ".", Population$OBS_VALUE)
+Population$OBS_VALUE <- as.numeric(Population$OBS_VALUE)
+
+Population <- Population[Population$GEO_OBJECT == "COM",]
+
+Population_Regions <- Population |>
+  mutate(Dép = substr(Dép, 1, 2)) |>
+    group_by(Dép) |>
+      reframe(OBS_VALUE_REG = floor(sum(OBS_VALUE)))
+
+
+Population_Regions <- Population_Regions |> arrange(Dép)
+#Pour être sur de l'ordre
+```
+
+```{r vp dep .Th}
+
+vehicule <- read_delim("Data/voitures-par-commune-par-energie.csv",
+                 delim = ";")
+
+vehicule$codgeo <- gsub("^2A", "2.1", vehicule$codgeo)
+vehicule$codgeo <- gsub("^2B", "2.2", vehicule$codgeo)
+
+vehicule$codgeo_numeric <- as.numeric(vehicule$codgeo)
+vehicule$date_arrete <- as.Date(vehicule$date_arrete, format="%Y-%m-%d")
+
+Vehicule_2024_06_30 <- subset(vehicule, format(date_arrete, "%Y") == "2024" & format(date_arrete, "%m") <= "06" & format(date_arrete, "%d") <= "30")
+#ressencement à la dernière date disponiblvehiculee 2024/06/30
+
+Vehicule_2024_06_30 <- Vehicule_2024_06_30[,c(6:9,2)]
+
+Vehicule_2024_06_30$codgeo_numeric <- as.character(Vehicule_2024_06_30$codgeo_numeric)
+
+Vehicule_2024_06_30$codgeo_numeric <- ifelse(nchar(Vehicule_2024_06_30$codgeo_numeric) == 4, 
+                                paste0("0", Vehicule_2024_06_30$codgeo_numeric),
+                                Vehicule_2024_06_30$codgeo_numeric)
+
+Vehicule_2024_06_30$codgeo_numeric <- gsub("^2.1", "2A", Vehicule_2024_06_30$codgeo_numeric)
+Vehicule_2024_06_30$codgeo_numeric <- gsub("^2.2", "2B", Vehicule_2024_06_30$codgeo_numeric)
+
+vehicule_région <- Vehicule_2024_06_30 |>
+  mutate(Département = substr(codgeo_numeric, 1, 2)) |>
+    group_by(Département) |>
+      reframe(nb_vp_rechargeable_el = sum(nb_vp_rechargeables_el),
+              nb_vp_rechargeables_gaz = sum(nb_vp_rechargeables_gaz),
+              nb_vp = sum(nb_vp))
+
+```
+
+```{r fusion .Th}
+
+Fusion <- cbind(vehicule_région, Population_Regions)
+Fusion <- Fusion |> select(Dép, everything())
+Fusion$Région <- NULL
+colnames(Fusion)[colnames(Fusion) == "OBS_VALUE_REG"] <- "Population"
+Fusion <- Fusion[-97,]
+
+Fr.reg <-read_sf("Data/departements.geojson")
+Fr.reg <- Fr.reg |> arrange(code)
+
+Tableau_Fini <- cbind(Fusion, Fr.reg)
+Tableau_Fini <- Tableau_Fini[,c(-1,-7)]
+```
+
+```{r Borne .Ma}
+#|echo: false
+#|warning: false
+#|message: false
+#|include: false
+
+df <- read_csv("Data/consolidation-etalab-schema-irve-statique-v-2.3.1-20240910.csv")
+df <- df[!(df$coordonneesXY == " [-1.499184, 50.636688]"),]
+df <- df[!(df$coordonneesXY == "[5.489857, 50.602526]"),]
+df <- df[!(df$coordonneesXY == "[8.102472, 49.299708]"),]
+
+dfb <- df[, -c(1:3,5:12,15:17,19:23,25:27,33:36,38:51)]
+dfb$longitude <- as.numeric(gsub("\\[|\\]|\\s", "", sapply(strsplit(dfb$coordonneesXY, ","), `[`, 1)))
+dfb$latitude <- as.numeric(gsub("\\[|\\]|\\s", "", sapply(strsplit(dfb$coordonneesXY, ","), `[`, 2)))
+
+bornes_sf <- st_as_sf(dfb, coords = c("longitude", "latitude"), crs = 4326)
+
+
+url <- "https://france-geojson.gregoiredavid.fr/repo/departements.geojson"
+france_dept <- st_read(url,
+                       quiet = TRUE)
+
+
+# Jointure spatiale entre les départements et les bornes
+bornes_par_dept <- dfb |>
+  filter(!is.na(code_insee_commune)) |>
+    group_by(code_insee_commune, date_mise_en_service) |>
+      summarise(nombre_bornes = n(),
+                puissance_moyenne = mean(puissance_nominale, 
+                                         na.rm = TRUE)) |>
+        left_join(france_dept, 
+                  by = c("code_insee_commune" = "code"))
+
+
+bornes_par_dept <- st_join(france_dept, bornes_sf) |>
+  group_by(code) |>  # "code" représente ici le code département
+     summarise(nombre_bornes = n())
+
+
+
+dfb$date_mise_en_service <- as.Date(dfb$date_mise_en_service, format = "%Y-%m-%d")
+dfb$annee_mise_en_service <- format(dfb$date_mise_en_service, "%Y")
+
+
+dfb_clean <- dfb |>
+  filter(annee_mise_en_service >= 2015 & annee_mise_en_service <= 2024 & !is.na(annee_mise_en_service))
+
+dfb_clean <- dfb |>
+  filter(!is.na(puissance_nominale) & !is.na(date_mise_en_service))
+
+dfb_clean <- dfb |>
+  filter(annee_mise_en_service >= 2015 & annee_mise_en_service <= 2024 & !is.na(annee_mise_en_service))
+  
+dfb_clean$annee_mise_en_service <- as.numeric(dfb_clean$annee_mise_en_service)
+
+
+total_bornes <- nrow(dfb_clean)
+puissance_moyenne <- mean(dfb_clean$puissance_nominale)
+# round(puissance_moyenne,2)
+
+bornes_par_annee <- as.data.frame(table(dfb_clean$annee_mise_en_service))
+names(bornes_par_annee) <- c("Annee", "Nombre_de_bornes")
+# as.character(puissance_moyenne)
+# as.character(total_bornes)
+# mean(dfb$tarification)
+
+
+# Calculer l'opérateur le plus fréquent et le nombre de bornes associées
+operateur_top <- df|>
+  filter(!is.na(nom_operateur)) |>   
+    group_by(nom_operateur) |>
+      summarise(nb_bornes = n()) |>
+        arrange(desc(nb_bornes)) |>
+          slice(1)  
+
+# Extraire le nom de l'opérateur et le nombre de bornes
+nom_operateur_top <- operateur_top$nom_operateur
+nb_bornes_top <- operateur_top$nb_bornes
+```
+
+```{r modif date valuebox .Th}
+
+data_agg <- aggregate(cbind(nb_vp_rechargeables_el, nb_vp) ~ date_arrete, vehicule, sum)
+
+data_agg$electric_pct <- (data_agg$nb_vp_rechargeables_el / data_agg$nb_vp_rechargeables_el[1]) * 100
+data_agg$essence_pct <- (data_agg$nb_vp / data_agg$nb_vp[1]) * 100
+
+data_2023 <- subset(vehicule, format(date_arrete, "%Y") == "2023" & format(date_arrete, "%m") <= "06" & format(date_arrete, "%d") <= "30")
+data_2024 <- Vehicule_2024_06_30
+
+#ELECTRIQUE
+total_voitures_electriques_2023 <- sum(data_2023$nb_vp_rechargeables_el, na.rm=TRUE)
+total_voitures_electriques_2024 <- sum(data_2024$nb_vp_rechargeables_el, na.rm=TRUE)
+
+
+pourcentage_evolution <- round(((total_voitures_electriques_2024 - total_voitures_electriques_2023) / total_voitures_electriques_2023) * 100,1)
+
+#ESSENNCE
+total_voitures_essence_2023 <- sum(data_2023$nb_vp, na.rm=TRUE)
+total_voitures_essence_2024 <- sum(data_2024$nb_vp, na.rm=TRUE)
+
+pourcentage_evolution2 <- round(((total_voitures_essence_2024 - total_voitures_essence_2023) / total_voitures_essence_2023)*100,1)
+
+
+#Difference du nombre de voiture entre les années
+Diff_par_an <- data_agg |>
+  mutate(year = format(date_arrete, "%Y")) |>        
+    group_by(year) |>
+     summarise(total_vp = sum(nb_vp, na.rm = TRUE),
+               total_vp_rechargeables_el = sum(nb_vp_rechargeables_el, na.rm = TRUE)) |>
+       mutate(change_vp = total_vp - lag(total_vp),
+              change_vp_el = total_vp_rechargeables_el - lag(total_vp_rechargeables_el))
+```
+
+# Accueil
+
+## Column {width="20%"}
+
+```{r valuebox electrique .Th}
+#| content: valuebox
+#| title: "Voitures éléctriques immatriculées (2024)"
+
+list(
+  color = "danger",
+  value = total_voitures_electriques_2024)
+```
+
+```{r valuebox evolution electrique .Th}
+#| content: valuebox
+#| title: "Évolution par rapport à l'année précédente (2023-2024)"
+
+list(
+  color = "danger",
+  value = paste0(pourcentage_evolution ,"%"))
+```
+
+```{r valuebox essence .Th}
+#| content: valuebox
+#| title: "Voitures à essence immatriculées (2024)"
+
+list(
+  color = "primary",
+  value = total_voitures_essence_2024)
+```
+
+```{r valuebox evolution essence .Th}
+#| content: valuebox
+#| title: "Évolution par rapport à l'année précédente (2023-2024)"
+
+list(
+  color = "primary",
+  value = paste0(pourcentage_evolution2 ,"%"))
+```
+
+## Column
+
+```{r tableau .Th}
+#| title: "Véhicule & population par département"
+
+datatable <- Tableau_Fini[,c(1,6,2,4,5)]
+colnames(datatable)[colnames(datatable) == "nom"] <- "Nom"
+colnames(datatable)[colnames(datatable) == "nb_vp_rechargeable_el"] <- "Véhicule électrique"
+colnames(datatable)[colnames(datatable) == "nb_vp"] <- "Véhicule essence"
+
+datatable(datatable,
+          rownames = FALSE)
+```
+
+##  {.tabset width="35%"}
+
+```{r carte & graph electrique .Th}
+#| title: "Voitures Electriques"
+
+par(mfrow =c(1,2))
+
+theme_custom <- theme_void() +
+  theme(
+    plot.margin = margin(1, 1, 10, 1, "pt"),
+    plot.background = element_rect(fill = "#CBD7A6", color = NA),
+    legend.position = "right",
+    legend.title = element_text(hjust = 0.5, color = "black", face = "bold"),
+    legend.text = element_text(color = "black"))
+
+# Plot
+Tableau_Fini$ProportionElectrique <- Tableau_Fini$nb_vp_rechargeable_el/(Tableau_Fini$nb_vp_rechargeable_el+Tableau_Fini$nb_vp+Tableau_Fini$nb_vp_rechargeables_gaz)
+
+ggplot(Tableau_Fini) +
+  geom_sf(aes(geometry = geometry, fill = ProportionElectrique)) +
+  labs(fill = "Proportion de véhicules \n électriques par département \n en France") +
+  guides(
+    fill = guide_legend(
+           nrow = 4,
+           title.position = "top",
+           label.position = "right")) +
+  scale_fill_gradient(low = "white", 
+                      high = "#FFFD55") +  
+  theme_custom +
+  theme(aspect.ratio = 1.05)
+
+# Grpahique
+ data_agg$Pourcentage_Electrique <- (data_agg$nb_vp_rechargeables_el / data_agg$nb_vp_rechargeables_el[1]) * 100
+
+G1 <- ggplot(data_agg, aes(x=date_arrete)) +
+  geom_line(aes(y=Pourcentage_Electrique, color="Voitures électriques")) +
+  labs(title="Évolution en pourcentage des voitures électriques et essence", 
+       x="Date", y="Pourcentage d'évolution") +
+  scale_color_manual("", 
+                     breaks = c("Voitures électriques"),
+                     values = c("Voitures électriques" = "yellow")) +
+  theme_minimal() +
+  theme(
+    panel.background = element_rect(fill = "#CBD7A6", color = NA), # Couleur de fond
+    plot.background = element_rect(fill = "#CBD7A6", color = NA)       # Couleur de fond autour du graphique
+  )
+
+ggplotly(G1)
+```
+
+```{r carte & graph essence .Th}
+#| title: "Voitures Essences "
+
+par(mfrow =c(1,2))
+
+# Plot
+Tableau_Fini$ProportionEssence <- Tableau_Fini$nb_vp/(Tableau_Fini$nb_vp_rechargeable_el+Tableau_Fini$nb_vp+Tableau_Fini$nb_vp_rechargeables_gaz)
+
+ggplot(Tableau_Fini)  +
+  geom_sf(aes(geometry = geometry, fill = ProportionEssence)) +
+  labs(fill = "Proportion de véhicules \n esseneces par département \n en France") +
+  guides(fill = guide_legend(nrow = 5,
+                             title.position = "top",
+                             label.position = "right")) +
+  scale_fill_gradient(low = "white", high = "#0C3E7A") +  
+  theme_custom +
+  theme(aspect.ratio = 1.05)
+
+# Graphique 
+data_agg$Pourcentage_Essence <- (data_agg$nb_vp / data_agg$nb_vp[1]) * 100
+
+
+G2<-ggplot(data_agg, aes(x=date_arrete)) +
+  geom_line(aes(y=Pourcentage_Essence, color="Voitures essences")) +
+  labs(title="Évolution en pourcentage des voitures  essences", 
+       x="Date", 
+       y="Pourcentage d'évolution") +
+  scale_color_manual("", 
+                     breaks = c("Voitures essences"),
+                     values = c("Voitures essences" = "#0C3E7A")) +
+  theme_minimal() +
+  theme(
+    panel.background = element_rect(fill = "#CBD7A6", color = NA),
+    plot.background = element_rect(fill = "#CBD7A6", color = NA))
+
+ggplotly(G2)
+```
+
+```{r garphique electrique VS essence .Th}
+#| title: "Comparaison "
+
+par(mfrow =c(1,2))
+
+#GRAPHIQUE POURCENTAGE
+G3 <- ggplot(data_agg, aes(x=date_arrete)) +
+  geom_line(aes(y=electric_pct, color="Voitures électriques")) +
+  geom_line(aes(y=essence_pct, color="Voitures essence")) +
+  labs(title="Évolution en pourcentage des voitures électriques et essence", 
+       x="Date",
+       y="Pourcentage d'évolution") +
+  scale_color_manual("", 
+                     breaks = c("Voitures électriques", "Voitures essence"),
+                     values = c("Voitures électriques" = "#FFFD55", "Voitures essence" = "#0C3E7A")) +
+  theme_minimal()+
+  theme(
+    panel.background = element_rect(fill = "#CBD7A6", color = NA),
+    plot.background = element_rect(fill = "#CBD7A6", color = NA))
+
+ggplotly(G3)
+
+
+#GRAPHIQUE CHIFFRE BRUT
+G4 <- ggplot(Diff_par_an, aes(x = as.integer(year))) +
+  geom_line(aes(y= change_vp_el, color="Voitures électriques")) + 
+  geom_line(aes(y= change_vp, color = "Voitures essence")) + 
+  labs(title = "Évolution annuelle du nombre de véhicules supplémentaires",
+       x = "Année",
+       y = "Véhicules supplémentaire") +
+  scale_color_manual("", 
+                     breaks = c("Voitures électriques", "Voitures essence"),
+                     values = c("Voitures électriques" = "#FFFD55", "Voitures essence" = "#0C3E7A")) +
+  theme_minimal() +
+  theme(
+         plot.background = element_rect(fill = "#CBD7A6", color = NA))
+  
+ggplotly(G4)
+
+```
+
+# Borne
+
+## Column {width="20%"}
+
+```{r valuebox Nombre borne .Ma}
+#| content: valuebox
+#| title: "Nombre de bornes de recharges en service"
+
+list(
+  color = "danger",
+  value = nrow(df))
+```
+
+```{r valuebox Puissance Borne .Ma}
+#| content: valuebox
+#| title: "Moyenne de la puissance des bornes en kW"
+
+list(
+  color = "danger",
+  value =  paste0(round(puissance_moyenne,2),"Kw"))
+```
+
+```{r valuebox Opérateur Borne .Ma}
+#| content: valuebox
+#| title: "Opérateur principal avec son nombre de bornes"
+
+list(
+  color = "danger",
+  value = paste0(nom_operateur_top," & ",nb_bornes_top, " bornes"))
+```
+
+## {.tabset}
+
+```{r Bornes 2024 .Ma}
+#| title: "2024"
+
+leaflet(dfb_clean |>
+  filter(annee_mise_en_service <= 2024)) |>
+    addTiles() |>
+      addCircleMarkers(lng = ~longitude,
+                       lat = ~latitude,
+                       popup = ~paste("<strong>Opérateur:</strong>", ifelse(is.na(nom_operateur), "Non disponible", nom_operateur), "<br>",
+                                      "<strong>Tarification:</strong>", ifelse(is.na(tarification), "Non disponible", tarification), "<br>",
+                                      "<strong>Puissance nominale:</strong>", ifelse(is.na(puissance_nominale), "Non disponible", puissance_nominale), "<br>",
+                                      "<strong>Date de mise en service:</strong>", ifelse(is.na(annee_mise_en_service), "Non disponible", annee_mise_en_service),"<br>",
+                                      "<strong>Horaires:</strong>", ifelse(is.na(horaires), "Non disponible", horaires)),
+                       radius = 0.0025,
+                       color = "#FFFD55",
+                       fillOpacity = 0.5) |>
+         setView(lng = 2.213749, lat = 46.227638, zoom = 6)
+
+
+```
+
+```{r Bornes 2021 .Ma}
+#| title: "2021"
+
+leaflet(dfb_clean |> 
+  filter(annee_mise_en_service <= 2021)) |>
+    addTiles() |>
+      addCircleMarkers(lng = ~longitude,
+                       lat = ~latitude,
+                       popup = ~paste("<strong>Opérateur:</strong>", ifelse(is.na(nom_operateur), "Non disponible", nom_operateur), "<br>",
+                                      "<strong>Tarification:</strong>", ifelse(is.na(tarification), "Non disponible", tarification), "<br>",
+                                      "<strong>Puissance nominale:</strong>", ifelse(is.na(puissance_nominale), "Non disponible", puissance_nominale), "<br>",
+                                      "<strong>Date de mise en service:</strong>", ifelse(is.na(annee_mise_en_service), "Non disponible", annee_mise_en_service), "<br>",
+                                      "<strong>Horaires:</strong>", ifelse(is.na(horaires), "Non disponible", horaires)),
+                       radius = 0.0025,
+                       color = "#FFFD55",
+                       fillOpacity = 0.5) |>
+        setView(lng = 2.213749, lat = 46.227638, zoom = 6)
+
+```
+
+```{r Bornes 2016 .Ma}
+#| title: "2016"
+
+leaflet(dfb_clean |>
+  filter(annee_mise_en_service <= 2016)) |>
+    addTiles() |>
+      addCircleMarkers(lng = ~longitude,
+                       lat = ~latitude,
+                       popup = ~paste("<strong>Opérateur:</strong>", ifelse(is.na(nom_operateur), "Non disponible", nom_operateur), "<br>",
+                                      "<strong>Tarification:</strong>", ifelse(is.na(tarification), "Non disponible", tarification), "<br>",
+                                      "<strong>Puissance nominale:</strong>", ifelse(is.na(puissance_nominale), "Non disponible", puissance_nominale), "<br>",
+                                      "<strong>Date de mise en service:</strong>", ifelse(is.na(annee_mise_en_service), "Non disponible", annee_mise_en_service), "<br>",
+                                      "<strong>Horaires:</strong>", ifelse(is.na(horaires), "Non disponible", horaires)),
+                       radius = 0.0025,
+                       color = "#FFFD55",
+                       fillOpacity = 0.5) |>
+        setView(lng = 2.213749, lat = 46.227638, zoom = 6)
+```
+
+## Column {width="35%"}
+
+```{r Carte Borne .Ma}
+
+ggplot(bornes_par_dept) +
+      geom_sf(aes(fill = nombre_bornes), color = "black") +
+      scale_fill_gradient(low = "white", high = "#FFFD55", name = "Nombre de bornes") +
+      theme_minimal() +
+      labs(title = "Nombre de bornes par département en France") +
+      theme(axis.text = element_blank(),
+            axis.ticks = element_blank(),
+            panel.grid = element_blank(),
+            panel.background = element_blank()) +
+      theme_custom
+```
+
+```{r Graph Borne .Ma}
+
+G5 <- ggplot(bornes_par_annee, aes(x = Annee, y = Nombre_de_bornes)) +
+  geom_bar(stat = "identity", fill = "#FFFD55") +
+  labs(title = "Nombre de bornes par année de mise en service",
+       x = "Année",
+       y = "Nombre de bornes") +
+  theme_minimal() +
+  theme(
+    panel.background = element_rect(fill = "#CBD7A6", color = NA),
+    plot.background = element_rect(fill = "#CBD7A6", color = NA))
+
+ggplotly(G5)
+
+
+```
+
+# Annexe
+
+Les données utilisées proviennent du site [defis.data.gouv](https://defis.data.gouv.fr/defis/vehicules-electriques) dans le cadre du [Open Data University Challenge](https://www.opendatauniversity.org/), plus précisément le thème "véhicules électriques.\
+Les données utilisées sont les suivantes:
+
+-   Fichier consolidé des Bornes de Recharge pour Véhicules Électriques : <https://defis.data.gouv.fr/datasets/5448d3e0c751df01f85d0572>
+-   Voitures particulières immatriculées par commune et par type de recharge : <https://defis.data.gouv.fr/datasets/628310650b8550478a9ddd2d>
+-   Population : <https://defis.data.gouv.fr/datasets/53699d0ea3a729239d205b2e>
+
+\
+Les chiffres du jeu de données de voitures immatriculées ne correspondent pas à un parc en circulation, ni à un total d'immatriculations. Ce jeu de données a été établi à partir d'une base de données issue du parc administratif.\
+L'idée étant de focaliser dans les deux premières colonnes du jeu de données sur les véhicules (a priori récents et roulant) nécessitant une borne de recharge, il a été décidé de le faire à partir d'une base plus exhaustive, même si les créateur du jeu de données savent pertinemment qu'y sont encore présentes des cartes grises valides de vieux véhicules thermiques qui ne roulent plus.\
+\
+Dashboard réaliser par :
+
+- [Thomas Barat](https://www.linkedin.com/in/thomas-barat-14849530a/)
+- [Mathéo Richer](https://www.linkedin.com/in/math%C3%A9o-richer-090426337/)
+- [Amaury Coutant](https://www.linkedin.com/in/amaury-coutant-1440211a7/)
